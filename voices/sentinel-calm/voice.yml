@@ -1,0 +1,58 @@
+schema_version: 1
+
+id: sentinel-calm
+name: Sentinel Calm
+version: 1.0.0
+
+description: >
+  Calm, authoritative, high-clarity voice profile dedicated for permission prompts, warnings, and error alerts.
+
+language:
+  primary: zh
+  supported:
+    - zh
+    - en
+    - mixed
+
+style:
+  energy: high
+  warmth: low
+  authority: high
+  pace: medium
+  expressiveness: restrained
+  fatigue: low
+
+reference:
+  wav: reference.wav
+  transcript: reference.txt
+  duration_sec: 10.35
+  sample_rate: 24000
+  channels: 1
+
+source:
+  type: ai_generated
+  provider: local_studio
+  source_label: sentinel_reference
+  usage: personal_experiment
+  redistributable: false
+
+use_cases:
+  - permission
+  - warning
+  - error
+  - security
+
+tags:
+  - calm
+  - authoritative
+  - alert
+  - clear
+
+quality:
+  status: approved
+  naturalness: 5
+  intelligibility: 5
+  bilingual: 5
+  low_fatigue: 5
+  short_prompt: 5
+  persona_fit: 5

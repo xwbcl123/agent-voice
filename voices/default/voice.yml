@@ -1,0 +1,55 @@
+schema_version: 1
+
+id: default
+name: Default Voice
+version: 1.0.0
+
+description: >
+  Baseline high-fidelity voice profile for general agent notifications and coding workflow summaries.
+
+language:
+  primary: zh
+  supported:
+    - zh
+    - en
+    - mixed
+
+style:
+  energy: medium
+  warmth: medium
+  authority: medium
+  pace: medium
+  expressiveness: restrained
+  fatigue: low
+
+reference:
+  wav: reference.wav
+  transcript: reference.txt
+
+source:
+  type: consented_person
+  provider: local_studio
+  source_label: baseline_reference
+  usage: personal_experiment
+  redistributable: false
+
+use_cases:
+  - default
+  - coding
+  - completion
+  - turn_complete
+
+tags:
+  - baseline
+  - clear
+  - neutral
+  - low-fatigue
+
+quality:
+  status: approved
+  naturalness: 5
+  intelligibility: 5
+  bilingual: 4
+  low_fatigue: 5
+  short_prompt: 5
+  persona_fit: 4

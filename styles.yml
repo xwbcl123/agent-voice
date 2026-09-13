@@ -1,0 +1,135 @@
+schema_version: 1
+
+profiles:
+  neutral:
+    name: Neutral
+    description: Balanced default delivery for everyday use.
+    instruction_zh: >
+      请用自然、清晰、平衡的语气说话，保持正常语速和适度停顿，
+      不要刻意夸张情绪。
+    instruction_en: >
+      Speak naturally and clearly with balanced emotion,
+      normal pacing, and moderate pauses. Avoid exaggerated delivery.
+    speed: 1.00
+    gain_db: 0
+    tags: [default, balanced, low-fatigue]
+
+  warm:
+    name: Warm
+    description: Warm, reassuring and low-fatigue.
+    instruction_zh: >
+      请用温暖、自然、令人安心的语气说话，语速略慢，
+      保持轻柔但清晰，不要耳语。
+    instruction_en: >
+      Speak warmly, naturally and reassuringly,
+      slightly slower than normal. Keep the voice gentle but clear,
+      without whispering.
+    speed: 0.95
+    gain_db: 0
+    tags: [warm, reassuring, calm]
+
+  cheerful:
+    name: Cheerful
+    description: Friendly and subtly upbeat.
+    instruction_zh: >
+      请用轻松、友好、略带笑意的语气说话，保持自然活力，
+      不要过度兴奋，也不要喊叫。
+    instruction_en: >
+      Speak in a friendly, cheerful tone with a subtle smile
+      and natural energy. Do not sound theatrical or shout.
+    speed: 1.03
+    gain_db: 0
+    tags: [happy, friendly, completion]
+
+  calm:
+    name: Calm
+    description: Calm, composed and steady.
+    instruction_zh: >
+      请用平静、沉着、稳定的语气说话，适当放慢节奏，
+      使用自然停顿，并保持发音清晰。
+    instruction_en: >
+      Speak calmly, steadily and with composure.
+      Use slightly slower pacing, natural pauses, and clear articulation.
+    speed: 0.92
+    gain_db: 0
+    tags: [calm, composed, focus]
+
+  serious:
+    name: Serious
+    description: Controlled, authoritative and clear.
+    instruction_zh: >
+      请用认真、沉稳、克制而清晰的语气说话，
+      突出关键信息，但不要制造恐慌或显得生硬。
+    instruction_en: >
+      Speak seriously, clearly and with controlled authority.
+      Emphasize important information without sounding alarming or harsh.
+    speed: 0.96
+    gain_db: 0
+    tags: [serious, permission, important]
+
+  urgent:
+    name: Urgent
+    description: Firm and attention-catching without shouting.
+    instruction_zh: >
+      请用明确、坚定、稍显紧迫的语气说话，节奏略快，
+      清楚突出需要立即关注的信息，但不要喊叫。
+    instruction_en: >
+      Speak clearly and firmly with moderate urgency
+      and slightly faster pacing. Highlight what needs immediate attention,
+      but do not shout.
+    speed: 1.08
+    gain_db: 1
+    tags: [urgent, warning, error]
+
+  curious:
+    name: Curious
+    description: Bright, interested and exploratory.
+    instruction_zh: >
+      请用明亮、好奇、富有探索感的语气说话，
+      保持自然轻快，并在关键发现处给予适度强调。
+    instruction_en: >
+      Speak in a bright, curious and exploratory tone.
+      Keep the delivery naturally light and gently emphasize key discoveries.
+    speed: 1.02
+    gain_db: 0
+    tags: [research, discovery, insight]
+
+  concise:
+    name: Concise
+    description: Direct and efficient notification delivery.
+    instruction_zh: >
+      请用简洁、直接、清晰的方式说话，减少不必要的停顿，
+      保持自然语气，不要显得急躁。
+    instruction_en: >
+      Speak concisely, directly and clearly,
+      with minimal unnecessary pauses while remaining natural and unhurried.
+    speed: 1.07
+    gain_db: 0
+    tags: [short, efficient, notification]
+
+  narrator:
+    name: Narrator
+    description: Warm editorial narration for longer summaries.
+    instruction_zh: >
+      请用温暖、沉稳、有叙事感的语气说话，
+      保持流畅节奏和自然层次，在段落转折处适当停顿。
+    instruction_en: >
+      Speak with a warm, grounded editorial narration style.
+      Maintain a flowing rhythm, natural phrasing,
+      and gentle pauses at transitions.
+    speed: 0.92
+    gain_db: 0
+    tags: [summary, long-form, editorial]
+
+  soft:
+    name: Soft
+    description: Gentle delivery, separate from playback volume.
+    instruction_zh: >
+      请用较轻柔、贴近而清晰的语气说话，
+      保持完整发声，不要变成耳语。
+    instruction_en: >
+      Speak softly, closely and clearly,
+      while maintaining full vocal support and avoiding a whisper.
+    speed: 0.96
+    gain_db: -1
+    tags: [soft, private, evening]

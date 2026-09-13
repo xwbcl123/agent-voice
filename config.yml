@@ -1,0 +1,61 @@
+# ==============================================================================
+# Agent Voice v4.0 Global Configuration (config.yml)
+# Location: ~/.config/agent-voice/config.yml
+# ==============================================================================
+
+# Default voice profile and delivery style when not specified
+default_voice: default
+default_style: neutral
+
+# Event-driven routing table (Voice × Style orthogonal routing)
+# Accepts scalar (voice_id) or object ({voice: <id>, style: <id>})
+routing:
+  default:
+    voice: default
+    style: neutral
+
+  task_complete:
+    voice: default
+    style: cheerful
+
+  turn_complete:
+    voice: default
+    style: concise
+
+  permission:
+    voice: sentinel-calm
+    style: serious
+
+  warning:
+    voice: sentinel-calm
+    style: urgent
+
+  error:
+    voice: sentinel-calm
+    style: serious
+
+  research:
+    voice: default
+    style: curious
+
+  summary:
+    voice: martin-primary
+    style: narrator
+
+  background_done:
+    voice: default
+    style: concise
+
+# Runtime behaviors
+behavior:
+  busy_policy: drop        # drop | wait
+  max_chars: 300           # Maximum speech text length to avoid abnormal long synthesis
+  playback: afplay         # System audio player on macOS
+  log_full_text: false     # Prevent logging sensitive task text
+  max_instruction_chars: 400
+  require_instruct: false
+  default_instruction_language: auto
+
+# Audition configuration
+audition:
+  corpus: default

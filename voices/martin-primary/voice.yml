@@ -1,0 +1,58 @@
+schema_version: 1
+
+id: martin-primary
+name: Martin Primary
+version: 1.0.0
+
+description: >
+  Martin's self-recorded personal voice profile for everyday agent notifications, coding summaries, and reflections.
+
+language:
+  primary: zh
+  supported:
+    - zh
+    - en
+    - mixed
+
+style:
+  energy: medium
+  warmth: high
+  authority: medium
+  pace: medium
+  expressiveness: natural
+  fatigue: low
+
+reference:
+  wav: reference.wav
+  transcript: reference.txt
+  duration_sec: 9.40
+  sample_rate: 24000
+  channels: 1
+
+source:
+  type: self_recorded
+  provider: martin_studio
+  source_label: personal_recording
+  usage: personal_experiment
+  redistributable: false
+
+use_cases:
+  - default
+  - coding
+  - completion
+  - summary
+
+tags:
+  - personal
+  - natural
+  - warm
+  - low-fatigue
+
+quality:
+  status: approved
+  naturalness: 5
+  intelligibility: 5
+  bilingual: 5
+  low_fatigue: 5
+  short_prompt: 5
+  persona_fit: 5

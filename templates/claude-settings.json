@@ -1,0 +1,15 @@
+{
+  "_comment": "Add this snippet into ~/.claude/settings.json to enable Stop Hook dynamic voice summary",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/martin/.local/bin/claude-stop-summary.py || true"
+          }
+        ]
+      }
+    ]
+  }
+}

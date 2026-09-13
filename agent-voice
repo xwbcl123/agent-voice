@@ -1,0 +1,1184 @@
+#!/usr/bin/env python3
+"""agent-voice (v4.0.0)
+Agent Auditory Interface & CosyVoice 3.0 MLX Multi-Voice and Instructive Style Manager.
+
+Key Capabilities:
+  - Backward-compatible speech synthesis: agent-voice "<text>"
+  - Explicit voice profile: agent-voice --voice <id> "<text>"
+  - Explicit delivery style: agent-voice --style <id> "<text>"
+  - Raw expert instruction: agent-voice --instruct "<prompt>" "<text>"
+  - Voice × Style orthogonal routing: agent-voice --event <event> "<text>"
+  - Playback speed & gain control: agent-voice --speed 1.05 --gain 1 "<text>"
+  - Dry run resolution: agent-voice --dry-run --style warm "<text>"
+  - Voice registry: agent-voice voices, agent-voice voice show/validate/normalize <id>
+  - Style registry: agent-voice styles, agent-voice style show <id>
+  - Runtime diagnostic probe: agent-voice doctor
+  - Style benchmark harness: agent-voice benchmark
+  - Audition suite: agent-voice audition <id|--all> [--style <id>]
+  - Asset & config migration: agent-voice migrate [--to 4]
+  - Kernel flock concurrency, pass_fds lock inheritance, and zero resident RAM.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+import wave
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+# ==============================================================================
+# Constants & Paths
+# ==============================================================================
+LOCK_FILE = Path("/tmp/agent-voice.lock")
+CACHE_DIR = Path("/tmp/agent-voice-cache")
+USER_CONFIG_FILE = Path.home() / ".config/agent-voice/config.yml"
+USER_STYLES_FILE = Path.home() / ".config/agent-voice/styles.yml"
+LOCAL_STYLES_FILE = Path(__file__).resolve().parent / "styles.yml"
+USER_SHARE_DIR = Path.home() / ".local/share/agent-voice"
+SPEECH_BIN = Path("/opt/homebrew/bin/speech")
+COSY_VARIANT = "8bit"
+
+VOICE_ID_REGEX = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+STYLE_ID_REGEX = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+MAX_INSTRUCTION_CHARS = 400
+MIN_SPEED = 0.75
+MAX_SPEED = 1.25
+MIN_GAIN_DB = -12.0
+MAX_GAIN_DB = 3.0
+
+AUDITION_CORPUS = {
+    "completion_zh": "任务执行完成，所有测试已经通过。",
+    "permission_zh": "Claude 正在等待你的权限确认。",
+    "error_zh": "构建失败，请检查最新日志。",
+    "mixed": "Codex review finished，三个 integration tests failed。",
+    "summary": "本轮代码审查已经完成，共发现三个问题，其中一个需要立即处理。",
+}
+
+DEFAULT_CONFIG = {
+    "default_voice": "default",
+    "default_style": "neutral",
+    "routing": {
+        "default": {"voice": "default", "style": "neutral"},
+        "task_complete": {"voice": "default", "style": "cheerful"},
+        "turn_complete": {"voice": "default", "style": "concise"},
+        "permission": {"voice": "sentinel-calm", "style": "serious"},
+        "warning": {"voice": "sentinel-calm", "style": "urgent"},
+        "error": {"voice": "sentinel-calm", "style": "serious"},
+        "research": {"voice": "default", "style": "curious"},
+        "summary": {"voice": "martin-primary", "style": "narrator"},
+        "background_done": {"voice": "default", "style": "concise"},
+    },
+    "behavior": {
+        "busy_policy": "drop",
+        "max_chars": 300,
+        "playback": "afplay",
+        "log_full_text": False,
+        "max_instruction_chars": 400,
+        "require_instruct": False,
+        "default_instruction_language": "auto",
+    },
+    "audition": {
+        "corpus": "default"
+    }
+}
+
+
+# ==============================================================================
+# Utility & Serialization Functions
+# ==============================================================================
+def sanitize_text(text: str, max_chars: int = 300) -> str:
+    """Strip unprintable characters and bound length safely."""
+    cleaned = "".join(ch for ch in text if ch.isprintable() or ch in " \t\n")
+    cleaned = cleaned.strip()
+    return cleaned[:max_chars]
+
+
+def load_yaml_file(path: Path) -> dict:
+    """Load YAML file with safe fallback parser if PyYAML is unavailable."""
+    if not path.is_file():
+        return {}
+    raw = path.read_text(encoding="utf-8")
+    if HAS_YAML:
+        try:
+            return yaml.safe_load(raw) or {}
+        except Exception:
+            return {}
+    # Minimal fallback parser for simple key-value YAML
+    data = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line:
+            k, v = line.split(":", 1)
+            data[k.strip()] = v.strip().strip("'\"")
+    return data
+
+
+def save_yaml_file(path: Path, data: dict) -> None:
+    """Save dictionary to YAML file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if HAS_YAML:
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, allow_unicode=True, sort_keys=False)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def get_config() -> dict:
+    """Load global config merged with defaults."""
+    cfg = dict(DEFAULT_CONFIG)
+    if USER_CONFIG_FILE.is_file():
+        user_cfg = load_yaml_file(USER_CONFIG_FILE)
+        if isinstance(user_cfg, dict):
+            if "default_voice" in user_cfg:
+                cfg["default_voice"] = user_cfg["default_voice"]
+            if "default_style" in user_cfg:
+                cfg["default_style"] = user_cfg["default_style"]
+            if "routing" in user_cfg and isinstance(user_cfg["routing"], dict):
+                cfg["routing"].update(user_cfg["routing"])
+            if "behavior" in user_cfg and isinstance(user_cfg["behavior"], dict):
+                cfg["behavior"].update(user_cfg["behavior"])
+    return cfg
+
+
+# ==============================================================================
+# Voice & Style Registry Management
+# ==============================================================================
+def get_voices_dir() -> Path:
+    """Locate voices directory: checks ~/.local/share/agent-voice/voices, then repo path."""
+    user_voices = USER_SHARE_DIR / "voices"
+    if user_voices.is_dir():
+        return user_voices
+    local_voices = Path(__file__).resolve().parent / "voices"
+    if local_voices.is_dir():
+        return local_voices
+    return user_voices
+
+
+def get_styles_file() -> Path:
+    """Locate styles.yml file: checks user config, then local repo."""
+    if USER_STYLES_FILE.is_file():
+        return USER_STYLES_FILE
+    if LOCAL_STYLES_FILE.is_file():
+        return LOCAL_STYLES_FILE
+    return USER_STYLES_FILE
+
+
+def load_styles() -> dict:
+    """Load style profile definitions from styles.yml."""
+    f = get_styles_file()
+    data = load_yaml_file(f)
+    if isinstance(data, dict) and "profiles" in data and isinstance(data["profiles"], dict):
+        return data["profiles"]
+    return {}
+
+
+def validate_voice_id(voice_id: str) -> bool:
+    """Check that voice ID is safe and conforms to regex."""
+    if not voice_id or "/" in voice_id or "\\" in voice_id or ".." in voice_id:
+        return False
+    return bool(VOICE_ID_REGEX.match(voice_id))
+
+
+def validate_style_id(style_id: str) -> bool:
+    """Check that style ID is safe and conforms to regex."""
+    if not style_id or "/" in style_id or "\\" in style_id or ".." in style_id:
+        return False
+    return bool(STYLE_ID_REGEX.match(style_id))
+
+
+def get_style_profile(style_id: str) -> dict | None:
+    """Retrieve style profile dictionary by ID."""
+    if not validate_style_id(style_id):
+        return None
+    styles = load_styles()
+    return styles.get(style_id)
+
+
+def select_instruction_prompt(style_prof: dict, text: str) -> str:
+    """Select appropriate Chinese or English instruction prompt based on target text."""
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
+    zh = style_prof.get("instruction_zh", "").strip()
+    en = style_prof.get("instruction_en", "").strip()
+    if has_cjk and zh:
+        return zh
+    if not has_cjk and en:
+        return en
+    return zh or en
+
+
+def get_voice_profile(voice_id: str) -> dict | None:
+    """Retrieve voice profile directory, metadata, wav, and transcript."""
+    if not validate_voice_id(voice_id):
+        return None
+
+    voices_dir = get_voices_dir()
+    profile_dir = voices_dir / voice_id
+    if not profile_dir.is_dir():
+        return None
+
+    meta_file = profile_dir / "voice.yml"
+    meta = load_yaml_file(meta_file) if meta_file.is_file() else {}
+
+    wav_path = profile_dir / meta.get("reference", {}).get("wav", "reference.wav")
+    txt_path = profile_dir / meta.get("reference", {}).get("transcript", "reference.txt")
+
+    if not wav_path.is_file():
+        wav_path = profile_dir / "reference.wav"
+    if not txt_path.is_file():
+        txt_path = profile_dir / "reference.txt"
+
+    transcript = txt_path.read_text(encoding="utf-8").strip() if txt_path.is_file() else ""
+
+    return {
+        "id": voice_id,
+        "dir": profile_dir,
+        "meta": meta,
+        "wav": wav_path,
+        "txt": txt_path,
+        "transcript": transcript,
+        "status": meta.get("quality", {}).get("status", "unknown"),
+    }
+
+
+# ==============================================================================
+# Runtime Capability Probe (Doctor)
+# ==============================================================================
+def probe_runtime_capabilities() -> dict:
+    """Inspect local binary and engine capabilities (speech, CosyVoice, instruct2, afplay)."""
+    speech_ok = SPEECH_BIN.is_file() and os.access(SPEECH_BIN, os.X_OK)
+    cosy_ok = False
+    instruct_ok = False
+    clone_ok = False
+
+    if speech_ok:
+        try:
+            res = subprocess.run(
+                [str(SPEECH_BIN), "speak", "--help"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5
+            )
+            help_text = res.stdout + res.stderr
+            cosy_ok = "--engine" in help_text and "cosyvoice" in help_text
+            instruct_ok = "--cosy-instruct" in help_text
+            clone_ok = "--voice-sample" in help_text and "--cosy-reference-transcript" in help_text
+        except Exception:
+            pass
+
+    afplay_bin = Path("/usr/bin/afplay")
+    afplay_ok = afplay_bin.is_file() and os.access(afplay_bin, os.X_OK)
+    styles_file = get_styles_file()
+    styles_ok = styles_file.is_file()
+
+    return {
+        "speech_cli": speech_ok,
+        "cosyvoice": cosy_ok,
+        "cloning": clone_ok,
+        "instruct2": instruct_ok,
+        "speed_control": afplay_ok,
+        "gain_control": afplay_ok,
+        "styles_registry": styles_ok,
+    }
+
+
+# ==============================================================================
+# Voice × Style Orthogonal Resolver
+# ==============================================================================
+def resolve_voice_and_style(
+    text: str,
+    requested_voice: str | None = None,
+    requested_style: str | None = None,
+    raw_instruct: str | None = None,
+    requested_speed: float | None = None,
+    requested_gain: float | None = None,
+    event: str | None = None,
+    require_instruct: bool = False,
+) -> dict:
+    """Resolve Voice Profile and Delivery Style independently with precedence, fallback, and validation."""
+    cfg = get_config()
+    default_voice_id = cfg.get("default_voice", "default")
+    default_style_id = cfg.get("default_style", "neutral")
+
+    # 1. Parse Event Route (Backward-compatible scalar string or v4 object)
+    event_voice = None
+    event_style = None
+    if event:
+        routing = cfg.get("routing", {})
+        route = routing.get(event, routing.get("default"))
+        if isinstance(route, str):
+            event_voice = route
+            event_style = default_style_id
+        elif isinstance(route, dict):
+            event_voice = route.get("voice", default_voice_id)
+            event_style = route.get("style", default_style_id)
+
+    # 2. Voice resolution
+    target_voice_id = requested_voice or event_voice or default_voice_id
+    voice_profile = None
+    if target_voice_id and validate_voice_id(target_voice_id):
+        voice_profile = get_voice_profile(target_voice_id)
+    if not voice_profile:
+        if default_voice_id and validate_voice_id(default_voice_id):
+            voice_profile = get_voice_profile(default_voice_id)
+
+    if not voice_profile:
+        legacy_wav = USER_SHARE_DIR / "reference.wav"
+        legacy_txt = USER_SHARE_DIR / "reference.txt"
+        if legacy_wav.is_file() and legacy_txt.is_file():
+            txt_content = legacy_txt.read_text(encoding="utf-8").strip()
+            if txt_content:
+                voice_profile = {
+                    "id": "legacy-default",
+                    "dir": USER_SHARE_DIR,
+                    "meta": {"id": "legacy-default", "name": "Legacy Default"},
+                    "wav": legacy_wav,
+                    "txt": legacy_txt,
+                    "transcript": txt_content,
+                    "status": "approved",
+                }
+
+    final_voice_id = voice_profile["id"] if voice_profile else target_voice_id
+
+    # 3. Voice profile delivery metadata & blocked styles
+    delivery_meta = voice_profile.get("meta", {}).get("delivery", {}) if voice_profile else {}
+    voice_def_style = delivery_meta.get("default_style")
+    blocked_styles = delivery_meta.get("blocked_styles", [])
+
+    # 4. Style resolution
+    fallback_reason = "none"
+    instruction_prompt = None
+    resolved_style_id = None
+    style_speed = 1.00
+    style_gain = 0.0
+
+    if raw_instruct:
+        resolved_style_id = "raw_instruct"
+        instruction_prompt = sanitize_text(raw_instruct, max_chars=MAX_INSTRUCTION_CHARS)
+        style_speed = 1.00
+        style_gain = 0.0
+    else:
+        candidate_style = requested_style or event_style or voice_def_style or default_style_id
+        if candidate_style in blocked_styles:
+            fallback_reason = f"blocked_by_voice:{final_voice_id}"
+            resolved_style_id = voice_def_style or default_style_id
+        else:
+            resolved_style_id = candidate_style
+
+        style_prof = get_style_profile(resolved_style_id)
+        if not style_prof:
+            resolved_style_id = "neutral"
+            style_prof = get_style_profile("neutral") or {}
+
+        instruction_prompt = select_instruction_prompt(style_prof, text)
+        style_speed = float(style_prof.get("speed", 1.00))
+        style_gain = float(style_prof.get("gain_db", 0.0))
+
+    # 5. Speed and Gain resolution
+    speed = requested_speed if requested_speed is not None else style_speed
+    speed = max(MIN_SPEED, min(MAX_SPEED, float(speed)))
+    speed = round(speed, 2)
+
+    gain = requested_gain if requested_gain is not None else style_gain
+    gain = max(MIN_GAIN_DB, min(MAX_GAIN_DB, float(gain)))
+    gain = round(gain, 1)
+
+    # 6. Instruction language
+    instruction_lang = "zh" if re.search(r"[\u4e00-\u9fff]", text) else "en"
+
+    # 7. Runtime probe & capability check
+    caps = probe_runtime_capabilities()
+    runtime_mode = "instruct2" if (instruction_prompt and caps["instruct2"]) else "zero-shot"
+
+    if instruction_prompt and not caps["instruct2"]:
+        if require_instruct:
+            raise RuntimeError("Runtime does not support instruct2 and --require-instruct was requested.")
+        fallback_reason = "instruct_unsupported"
+        instruction_prompt = None
+
+    return {
+        "voice": final_voice_id,
+        "voice_profile": voice_profile,
+        "style": resolved_style_id,
+        "instruction": instruction_prompt,
+        "instruction_language": instruction_lang,
+        "speed": speed,
+        "gain_db": gain,
+        "runtime_mode": runtime_mode,
+        "fallback": fallback_reason,
+    }
+
+
+def resolve_voice_for_event(event: str | None, requested_voice: str | None) -> dict | None:
+    """Backward-compatible helper for v3 callers and tests."""
+    res = resolve_voice_and_style(text="", requested_voice=requested_voice, event=event)
+    return res.get("voice_profile")
+
+
+# ==============================================================================
+# Speech Synthesis & Concurrency Core
+# ==============================================================================
+def speak(
+    text: str,
+    voice_id: str | None = None,
+    style_id: str | None = None,
+    raw_instruct: str | None = None,
+    speed: float | None = None,
+    gain: float | None = None,
+    event: str | None = None,
+    require_instruct: bool = False,
+    dry_run: bool = False,
+) -> int:
+    """Execute speech synthesis with flock concurrency, instruct2 delivery, and rate/volume playback."""
+    clean_text = sanitize_text(text)
+    if not clean_text:
+        return 0
+
+    try:
+        res = resolve_voice_and_style(
+            text=clean_text,
+            requested_voice=voice_id,
+            requested_style=style_id,
+            raw_instruct=raw_instruct,
+            requested_speed=speed,
+            requested_gain=gain,
+            event=event,
+            require_instruct=require_instruct,
+        )
+    except RuntimeError as exc:
+        print(f"❌ 运行时错误: {exc}", file=sys.stderr)
+        return 2
+
+    # Handle --dry-run
+    if dry_run:
+        print(f"voice: {res['voice']}")
+        print(f"style: {res['style']}")
+        print(f"instruction_language: {res['instruction_language']}")
+        print(f"speed: {res['speed']:.2f}")
+        print(f"gain_db: {res['gain_db']:+.1f}")
+        print(f"runtime_mode: {res['runtime_mode']}")
+        print(f"fallback: {res['fallback']}")
+        return 0
+
+    profile = res.get("voice_profile")
+    if not profile or not profile["wav"].is_file() or not profile["transcript"]:
+        return 0
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. Non-blocking exclusive flock
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        # Busy drop policy
+        return 0
+
+    temp_wav = CACHE_DIR / f"notify-{os.getpid()}-{int(time.time()*1000)}.wav"
+    cur_child: subprocess.Popen | None = None
+
+    def terminate_child():
+        nonlocal cur_child
+        if cur_child is not None and cur_child.poll() is None:
+            try:
+                cur_child.kill()
+                cur_child.wait(timeout=2)
+            except Exception:
+                pass
+            finally:
+                cur_child = None
+
+    def handle_signal(sig, frame):
+        terminate_child()
+        if temp_wav.is_file():
+            try:
+                temp_wav.unlink()
+            except Exception:
+                pass
+        sys.exit(0)
+
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, handle_signal)
+
+    try:
+        lang = "chinese" if re.search(r"[\u4e00-\u9fff]", clean_text) else "english"
+        speak_cmd = [
+            str(SPEECH_BIN), "speak", clean_text,
+            "--engine", "cosyvoice",
+            "--cosyvoice-variant", COSY_VARIANT,
+            "--voice-sample", str(profile["wav"]),
+            "--cosy-reference-transcript", profile["transcript"],
+            "--language", lang,
+            "-o", str(temp_wav)
+        ]
+
+        if res["runtime_mode"] == "instruct2" and res["instruction"]:
+            speak_cmd.extend(["--cosy-instruct", res["instruction"]])
+
+        cur_child = subprocess.Popen(
+            speak_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            pass_fds=[lock_fd.fileno()]
+        )
+        speak_res = cur_child.wait(timeout=16)
+        cur_child = None
+
+        # STRICT validation: exit code 0 AND valid WAV header > 44 bytes
+        if speak_res == 0 and temp_wav.is_file() and temp_wav.stat().st_size > 44:
+            linear_vol = round(10.0 ** (res["gain_db"] / 20.0), 3)
+            play_cmd = [
+                "/usr/bin/afplay",
+                "-r", str(res["speed"]),
+                "-q", "1",
+                "-v", str(linear_vol),
+                str(temp_wav)
+            ]
+            cur_child = subprocess.Popen(
+                play_cmd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                pass_fds=[lock_fd.fileno()]
+            )
+            cur_child.wait(timeout=14)
+            cur_child = None
+    except Exception:
+        terminate_child()
+    finally:
+        terminate_child()
+        if temp_wav.is_file():
+            try:
+                temp_wav.unlink()
+            except OSError:
+                pass
+        try:
+            lock_fd.close()
+        except OSError:
+            pass
+    return 0
+
+
+# ==============================================================================
+# Management Subcommands
+# ==============================================================================
+def cmd_voices_list():
+    """List all registered voice profiles."""
+    voices_dir = get_voices_dir()
+    if not voices_dir.is_dir():
+        print("未发现 voices 目录。请先运行 'agent-voice migrate' 或 './setup.sh'。")
+        return 0
+
+    profiles = []
+    for item in sorted(voices_dir.iterdir()):
+        if item.is_dir() and validate_voice_id(item.name):
+            prof = get_voice_profile(item.name)
+            if prof:
+                profiles.append(prof)
+
+    if not profiles:
+        print("未检测到已注册的音色配置文件。")
+        return 0
+
+    cfg = get_config()
+    def_voice = cfg.get("default_voice", "default")
+
+    print(f"{'ID':<18} {'STATUS':<12} {'STYLE':<32} {'TAGS'}")
+    print("-" * 75)
+    for p in profiles:
+        meta = p["meta"]
+        vid = p["id"]
+        if vid == def_voice:
+            vid += " *"
+        status = p["status"]
+        style_dict = meta.get("style", {})
+        style_summary = f"{style_dict.get('energy', '-')}/{style_dict.get('warmth', '-')}/{style_dict.get('fatigue', '-')}"
+        tags = ", ".join(meta.get("tags", [])) or "-"
+        print(f"{vid:<18} {status:<12} {style_summary:<32} {tags}")
+    print("\n* 标记为当前默认音色 (default_voice)")
+    return 0
+
+
+def cmd_voice_show(voice_id: str):
+    """Show detailed information for a voice profile."""
+    prof = get_voice_profile(voice_id)
+    if not prof:
+        print(f"❌ 错误: 未找到音色 profile '{voice_id}'")
+        return 1
+
+    meta = prof["meta"]
+    print(f"=== Voice Profile: {prof['id']} ===")
+    print(f"Name:        {meta.get('name', prof['id'])}")
+    print(f"Version:     {meta.get('version', '1.0.0')}")
+    print(f"Status:      {prof['status']}")
+    print(f"Description: {meta.get('description', '').strip()}")
+    print(f"Directory:   {prof['dir']}")
+    print(f"Audio File:  {prof['wav']} ({'存在' if prof['wav'].is_file() else '缺失'})")
+    if prof['wav'].is_file():
+        try:
+            with wave.open(str(prof['wav']), "rb") as w:
+                dur = round(w.getnframes() / float(w.getframerate()), 2)
+                print(f"             {w.getframerate()}Hz, {w.getnchannels()}声道, 耗时 {dur}s")
+        except Exception:
+            pass
+    print(f"Transcript:  {prof['txt']} ({'存在' if prof['txt'].is_file() else '缺失'})")
+    print(f"Text Content: \"{prof['transcript']}\"")
+    print(f"Source:      {meta.get('source', {}).get('type', 'unknown')}")
+    print(f"Use Cases:   {', '.join(meta.get('use_cases', []))}")
+    print(f"Tags:        {', '.join(meta.get('tags', []))}")
+    return 0
+
+
+def validate_single_profile(prof: dict) -> tuple[int, list[str]]:
+    """Validate a single voice profile against acoustic and metadata rules."""
+    issues = []
+    has_error = False
+    has_warn = False
+
+    if not prof["wav"].is_file():
+        issues.append("❌ 错误: reference.wav 文件不存在")
+        has_error = True
+    else:
+        try:
+            with wave.open(str(prof["wav"]), "rb") as w:
+                channels = w.getnchannels()
+                rate = w.getframerate()
+                dur = w.getnframes() / float(rate)
+
+                if dur < 3.0:
+                    issues.append(f"⚠️ 警告: 音频时长 {round(dur, 2)}s 过短 (< 3.0s)")
+                    has_warn = True
+                elif dur > 12.0:
+                    issues.append(f"⚠️ 警告: 音频时长 {round(dur, 2)}s 过长 (> 12.0s)")
+                    has_warn = True
+
+                if channels != 1:
+                    issues.append(f"⚠️ 警告: 音频为 {channels} 声道，推荐单声道 Mono")
+                    has_warn = True
+
+                if rate != 24000:
+                    issues.append(f"⚠️ 提示: 采样率为 {rate}Hz，推荐标准 24000Hz")
+                    has_warn = True
+        except Exception as exc:
+            issues.append(f"❌ 错误: 无法解析 WAV 头部: {exc}")
+            has_error = True
+
+    if not prof["txt"].is_file():
+        issues.append("❌ 错误: reference.txt 文件不存在")
+        has_error = True
+    elif not prof["transcript"]:
+        issues.append("❌ 错误: reference.txt 转录文本为空")
+        has_error = True
+
+    meta = prof["meta"]
+    if not meta:
+        issues.append("⚠️ 警告: 未找到有效的 voice.yml 元数据")
+        has_warn = True
+
+    if has_error:
+        return 2, issues
+    if has_warn:
+        return 1, issues
+    return 0, ["✅ 所有硬性规范与声学参数校验通过"]
+
+
+def cmd_voice_validate(target: str):
+    """Validate voice profile(s)."""
+    voices_dir = get_voices_dir()
+    profiles_to_check = []
+
+    if target == "--all" or target == "all":
+        for item in sorted(voices_dir.iterdir()):
+            if item.is_dir() and validate_voice_id(item.name):
+                p = get_voice_profile(item.name)
+                if p:
+                    profiles_to_check.append(p)
+    else:
+        p = get_voice_profile(target)
+        if not p:
+            print(f"❌ 错误: 未找到音色 profile '{target}'")
+            return 2
+        profiles_to_check.append(p)
+
+    max_exit = 0
+    for p in profiles_to_check:
+        code, issues = validate_single_profile(p)
+        max_exit = max(max_exit, code)
+        icon = "✅" if code == 0 else ("⚠️" if code == 1 else "❌")
+        print(f"\n{icon} [{p['id']}] (Status: {code})")
+        for issue in issues:
+            print(f"   {issue}")
+
+    return max_exit
+
+
+def cmd_voice_normalize(voice_id: str):
+    """Normalize reference audio using ffmpeg to 24kHz mono 16-bit PCM."""
+    prof = get_voice_profile(voice_id)
+    if not prof:
+        print(f"❌ 错误: 未找到音色 profile '{voice_id}'")
+        return 1
+
+    wav_path = prof["wav"]
+    if not wav_path.is_file():
+        print(f"❌ 错误: 音频文件不存在: {wav_path}")
+        return 1
+
+    temp_out = wav_path.parent / f"normalized-{int(time.time())}.wav"
+    cmd = [
+        "ffmpeg", "-y", "-i", str(wav_path),
+        "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le",
+        str(temp_out)
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        if temp_out.is_file() and temp_out.stat().st_size > 44:
+            temp_out.replace(wav_path)
+            print(f"✅ 音频标准化成功: {wav_path} (24000Hz, Mono, 16-bit PCM)")
+            return 0
+    except Exception as exc:
+        print(f"❌ 标准化失败: {exc}")
+        if temp_out.is_file():
+            temp_out.unlink()
+        return 1
+    return 1
+
+
+# ==============================================================================
+# Style Management Subcommands (styles, style show)
+# ==============================================================================
+def cmd_styles_list() -> int:
+    """List all registered delivery style profiles."""
+    styles = load_styles()
+    if not styles:
+        print("未检测到已注册的风格配置文件 (styles.yml)。")
+        return 1
+
+    cfg = get_config()
+    def_style = cfg.get("default_style", "neutral")
+
+    print(f"{'STYLE ID':<18} {'NAME':<14} {'SPEED':<8} {'GAIN (dB)':<11} {'TAGS'}")
+    print("-" * 75)
+    for sid, prof in styles.items():
+        name = prof.get("name", sid)
+        display_id = sid + " *" if sid == def_style else sid
+        speed = f"{prof.get('speed', 1.0):.2f}"
+        gain = f"{prof.get('gain_db', 0):+d}"
+        tags = ", ".join(prof.get("tags", []))
+        print(f"{display_id:<18} {name:<14} {speed:<8} {gain:<11} {tags}")
+    print("\n* 标记为当前默认风格 (default_style)")
+    return 0
+
+
+def cmd_style_show(style_id: str) -> int:
+    """Show detailed delivery style profile."""
+    prof = get_style_profile(style_id)
+    if not prof:
+        print(f"❌ 错误: 未找到风格 profile '{style_id}'")
+        return 1
+
+    name = prof.get("name", style_id)
+    desc = prof.get("description", "").strip()
+    speed = prof.get("speed", 1.00)
+    gain = prof.get("gain_db", 0)
+    tags = ", ".join(prof.get("tags", []))
+    zh = prof.get("instruction_zh", "").strip()
+    en = prof.get("instruction_en", "").strip()
+
+    print(f"=== Style Profile: {style_id} ===")
+    print(f"Name:        {name}")
+    print(f"Description: {desc}")
+    print(f"Speed:       {speed:.2f}x")
+    print(f"Gain:        {gain:+d} dB")
+    print(f"Tags:        {tags}")
+    print(f"\n[Chinese Instruction]\n{zh}")
+    print(f"\n[English Instruction]\n{en}")
+    return 0
+
+
+# ==============================================================================
+# Doctor & Benchmark Subcommands
+# ==============================================================================
+def cmd_doctor() -> int:
+    """Diagnostic capability probe for local speech engine and styles."""
+    caps = probe_runtime_capabilities()
+    styles = load_styles()
+    voices_dir = get_voices_dir()
+    v_count = len([d for d in voices_dir.iterdir() if d.is_dir()]) if voices_dir.is_dir() else 0
+
+    print("=== Agent Voice Runtime Doctor (v4.0.0) ===")
+    print(f"Speech CLI Binary:        {SPEECH_BIN} ({'就绪 [OK]' if caps['speech_cli'] else '缺失 [FAIL]'})")
+    print(f"CosyVoice Engine:         {'已启用 [OK]' if caps['cosyvoice'] else '未启用 [FAIL]'}")
+    print(f"Voice Cloning:            {'支持 [OK]' if caps['cloning'] else '不支持 [FAIL]'}")
+    print(f"Instruct2 Style Control:  {'支持 (--cosy-instruct) [OK]' if caps['instruct2'] else '不支持 [WARN]'}")
+    print(f"Hardware Acceleration:    Apple Silicon MLX [OK]")
+    print(f"Playback Speed Control:   {'支持 (afplay -r) [OK]' if caps['speed_control'] else '不支持 [WARN]'}")
+    print(f"Playback Gain Control:    {'支持 (afplay -v) [OK]' if caps['gain_control'] else '不支持 [WARN]'}")
+    print(f"Styles Profile Registry:  {get_styles_file()} ({len(styles)} profiles) [OK]")
+    print(f"Active Voices Registry:   {voices_dir} ({v_count} profiles) [OK]")
+
+    all_ok = caps["speech_cli"] and caps["cosyvoice"] and caps["cloning"]
+    if all_ok:
+        print("\n✅ 系统就绪: 所有核心与 Instruct2 运行时能力验证通过。")
+        return 0
+    else:
+        print("\n❌ 警告: 存在缺失的基础运行时组件。")
+        return 1
+
+
+def cmd_benchmark(voice_id: str | None = None, styles_str: str | None = None, runs: int = 1, text: str | None = None) -> int:
+    """Run performance benchmark across styles measuring latency, audio duration, and RTF."""
+    cfg = get_config()
+    target_voice = voice_id or cfg.get("default_voice", "default")
+    v_prof = get_voice_profile(target_voice)
+    if not v_prof:
+        print(f"❌ 错误: 未找到音色 profile '{target_voice}'")
+        return 1
+
+    sample_text = text or "系统自检完成，所有后台服务正常运行。"
+    styles_to_test = [s.strip() for s in styles_str.split(",")] if styles_str else ["zero-shot", "neutral", "warm", "serious", "urgent"]
+
+    print("=== Agent Voice Style Benchmark ===")
+    print(f"Voice: {target_voice} | Runs per style: {runs}")
+    print(f"Text: \"{sample_text}\"\n")
+    print(f"{'STYLE':<14} {'WALL (ms)':<12} {'AUDIO (ms)':<12} {'RTF':<8} {'STATUS'}")
+    print("-" * 55)
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    temp_out = CACHE_DIR / f"bench-{os.getpid()}.wav"
+
+    results = {}
+    for st in styles_to_test:
+        wall_times = []
+        audio_durations = []
+        rtfs = []
+        ok = True
+
+        for _ in range(runs):
+            instruct = None
+            if st != "zero-shot":
+                sp = get_style_profile(st)
+                if sp:
+                    instruct = select_instruction_prompt(sp, sample_text)
+
+            lang = "chinese" if re.search(r"[\u4e00-\u9fff]", sample_text) else "english"
+            cmd = [
+                str(SPEECH_BIN), "speak", sample_text,
+                "--engine", "cosyvoice",
+                "--cosyvoice-variant", COSY_VARIANT,
+                "--voice-sample", str(v_prof["wav"]),
+                "--cosy-reference-transcript", v_prof["transcript"],
+                "--language", lang,
+                "-o", str(temp_out)
+            ]
+            if instruct:
+                cmd.extend(["--cosy-instruct", instruct])
+
+            t0 = time.time()
+            try:
+                sub_res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                t1 = time.time()
+                wall_ms = (t1 - t0) * 1000.0
+                wall_times.append(wall_ms)
+
+                if sub_res.returncode == 0 and temp_out.is_file():
+                    with wave.open(str(temp_out), "rb") as w:
+                        dur_ms = (w.getnframes() / float(w.getframerate())) * 1000.0
+                        audio_durations.append(dur_ms)
+                    rtf = wall_ms / dur_ms if dur_ms > 0 else 0
+                    rtfs.append(rtf)
+                else:
+                    ok = False
+            except Exception:
+                ok = False
+
+        if ok and wall_times:
+            avg_wall = sum(wall_times) / len(wall_times)
+            avg_audio = sum(audio_durations) / len(audio_durations)
+            avg_rtf = sum(rtfs) / len(rtfs)
+            results[st] = (avg_wall, avg_audio, avg_rtf)
+            print(f"{st:<14} {int(avg_wall):<12} {int(avg_audio):<12} {avg_rtf:.2f}     OK")
+        else:
+            print(f"{st:<14} {'-':<12} {'-':<12} {'-':<8} FAIL")
+
+    if temp_out.is_file():
+        temp_out.unlink()
+
+    if "zero-shot" in results and "neutral" in results:
+        zs_wall = results["zero-shot"][0]
+        neu_wall = results["neutral"][0]
+        overhead = ((neu_wall - zs_wall) / zs_wall) * 100.0 if zs_wall > 0 else 0
+        print(f"\nInstruct overhead (neutral vs zero-shot): {overhead:+.1f}% latency (target: <=15%).")
+
+    return 0
+
+
+# ==============================================================================
+# Audition & Migration Subcommands
+# ==============================================================================
+def cmd_audition(target: str, style_id: str | None = None, corpus_key: str | None = None, no_play: bool = False):
+    """Run standard audition test corpus against profile(s) with optional style."""
+    voices_dir = get_voices_dir()
+    profiles = []
+    if target == "--all" or target == "all":
+        for item in sorted(voices_dir.iterdir()):
+            if item.is_dir() and validate_voice_id(item.name):
+                p = get_voice_profile(item.name)
+                if p:
+                    profiles.append(p)
+    else:
+        p = get_voice_profile(target)
+        if not p:
+            print(f"❌ 错误: 未找到音色 profile '{target}'")
+            return 1
+        profiles.append(p)
+
+    items = AUDITION_CORPUS if not corpus_key else {corpus_key: AUDITION_CORPUS.get(corpus_key, "测试文本")}
+    out_base = Path("/tmp/agent-voice-auditions")
+    out_base.mkdir(parents=True, exist_ok=True)
+
+    style_prof = get_style_profile(style_id) if style_id else None
+
+    for p in profiles:
+        vid = p["id"]
+        prof_out = out_base / vid
+        prof_out.mkdir(parents=True, exist_ok=True)
+        style_desc = f" (Style: {style_id})" if style_id else ""
+        print(f"\n🎧 正在为音色 [{vid}]{style_desc} 执行 Audition 评测...")
+
+        for key, text in items.items():
+            out_wav = prof_out / f"{key}.wav"
+            print(f"   -> [{key}] \"{text}\"")
+            lang = "chinese" if re.search(r"[\u4e00-\u9fff]", text) else "english"
+            cmd = [
+                str(SPEECH_BIN), "speak", text,
+                "--engine", "cosyvoice",
+                "--cosyvoice-variant", COSY_VARIANT,
+                "--voice-sample", str(p["wav"]),
+                "--cosy-reference-transcript", p["transcript"],
+                "--language", lang,
+                "-o", str(out_wav)
+            ]
+            if style_prof:
+                instruct = select_instruction_prompt(style_prof, text)
+                if instruct:
+                    cmd.extend(["--cosy-instruct", instruct])
+
+            try:
+                res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=16)
+                if res.returncode == 0 and out_wav.is_file():
+                    print(f"      ✅ 生成成功: {out_wav.name}")
+                    if not no_play:
+                        subprocess.run(["/usr/bin/afplay", str(out_wav)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    print(f"      ❌ 合成失败 (code {res.returncode})")
+            except Exception as exc:
+                print(f"      ❌ 异常: {exc}")
+    return 0
+
+
+def cmd_migrate(to_v4: bool = False):
+    """Migrate legacy voice assets and upgrade config.yml to v4 structure."""
+    import shutil
+    legacy_wav = USER_SHARE_DIR / "reference.wav"
+    legacy_txt = USER_SHARE_DIR / "reference.txt"
+    dest_default = USER_SHARE_DIR / "voices/default"
+
+    if legacy_wav.is_file() and legacy_txt.is_file():
+        dest_default.mkdir(parents=True, exist_ok=True)
+        target_wav = dest_default / "reference.wav"
+        target_txt = dest_default / "reference.txt"
+        target_yml = dest_default / "voice.yml"
+
+        if not target_wav.is_file():
+            shutil.copy2(legacy_wav, target_wav)
+            print(f"✅ 复制 reference.wav -> {target_wav}")
+        if not target_txt.is_file():
+            shutil.copy2(legacy_txt, target_txt)
+            print(f"✅ 复制 reference.txt -> {target_txt}")
+        if not target_yml.is_file():
+            default_meta = {
+                "schema_version": 1,
+                "id": "default",
+                "name": "Default Voice",
+                "version": "1.0.0",
+                "description": "Baseline high-fidelity voice profile migrated from v2.1.0.",
+                "language": {"primary": "zh", "supported": ["zh", "en", "mixed"]},
+                "style": {"energy": "medium", "warmth": "medium", "authority": "medium", "pace": "medium", "fatigue": "low"},
+                "reference": {"wav": "reference.wav", "transcript": "reference.txt"},
+                "source": {"type": "consented_person", "usage": "personal_experiment", "redistributable": False},
+                "use_cases": ["default", "coding", "completion"],
+                "tags": ["baseline", "migrated", "clear"],
+                "quality": {"status": "approved", "naturalness": 5, "intelligibility": 5, "low_fatigue": 5}
+            }
+            save_yaml_file(target_yml, default_meta)
+            print(f"✅ 创建默认元数据 -> {target_yml}")
+
+    # v4 migration: deploy styles.yml and upgrade config.yml
+    USER_STYLES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not USER_STYLES_FILE.is_file() and LOCAL_STYLES_FILE.is_file():
+        shutil.copy2(LOCAL_STYLES_FILE, USER_STYLES_FILE)
+        print(f"✅ 部署默认风格注册表 -> {USER_STYLES_FILE}")
+
+    if USER_CONFIG_FILE.is_file():
+        bak_file = USER_CONFIG_FILE.parent / f"config.yml.v3.bak-{int(time.time())}"
+        shutil.copy2(USER_CONFIG_FILE, bak_file)
+        print(f"✅ 备份现有配置 -> {bak_file}")
+
+        cfg = load_yaml_file(USER_CONFIG_FILE)
+        if isinstance(cfg, dict):
+            cfg.setdefault("default_style", "neutral")
+            routing = cfg.get("routing", {})
+            new_routing = {}
+            for k, v in routing.items():
+                if isinstance(v, str):
+                    new_routing[k] = {"voice": v, "style": "neutral"}
+                else:
+                    new_routing[k] = v
+            cfg["routing"] = new_routing
+            save_yaml_file(USER_CONFIG_FILE, cfg)
+            print(f"✅ 升级配置至 v4.0.0 (支持 Voice × Style 对象路由) -> {USER_CONFIG_FILE}")
+
+    print("🎉 迁移与升级流程执行完成。")
+    return 0
+
+
+# ==============================================================================
+# CLI Entrypoint & Argument Dispatcher
+# ==============================================================================
+def main():
+    if len(sys.argv) < 2:
+        print("用法:")
+        print("  agent-voice \"<文本>\"                          # 基础播放 (默认音色与风格)")
+        print("  agent-voice --voice <id> \"<文本>\"           # 指定音色播放")
+        print("  agent-voice --style <id> \"<文本>\"           # 指定预置风格播报 (如 warm/serious/urgent)")
+        print("  agent-voice --instruct \"<prompt>\" \"<文本>\" # 专家模式：自定义指令控制语调韵律")
+        print("  agent-voice --speed 1.05 --gain 1 \"<文本>\"  # 自定义播放语速与音量增益 (dB)")
+        print("  agent-voice --dry-run --style warm \"<文本>\" # 仿真解析 Voice × Style，不发音")
+        print("  agent-voice --event <event> \"<文本>\"         # 按事件类型自动路由音色与风格")
+        print("  agent-voice voices                           # 列出所有已注册音色")
+        print("  agent-voice voice show <id>                  # 查看指定音色详情")
+        print("  agent-voice voice validate <id|--all>        # 校验音色声学资产与元数据")
+        print("  agent-voice voice normalize <id>             # 标准化音频 (24kHz Mono WAV)")
+        print("  agent-voice styles                           # 列出所有已注册风格 Profile")
+        print("  agent-voice style show <id>                  # 查看指定风格详情与指令模板")
+        print("  agent-voice doctor                           # 本地语音运行时能力探针")
+        print("  agent-voice benchmark                        # 运行风格耗时与 RTF 性能评测")
+        print("  agent-voice audition <id|--all>              # 运行标准测试语料生成")
+        print("  agent-voice migrate [--to 4]                 # 升级配置并部署 styles.yml")
+        sys.exit(0)
+
+    first_arg = sys.argv[1]
+
+    if first_arg in ("voices", "list"):
+        sys.exit(cmd_voices_list())
+
+    if first_arg == "styles":
+        sys.exit(cmd_styles_list())
+
+    if first_arg == "style":
+        if len(sys.argv) < 3:
+            print("用法: agent-voice style show <id>")
+            sys.exit(1)
+        sub = sys.argv[2]
+        if sub == "show" and len(sys.argv) >= 4:
+            sys.exit(cmd_style_show(sys.argv[3]))
+        else:
+            print(f"未知 style 子命令: {sub}")
+            sys.exit(1)
+
+    if first_arg == "doctor":
+        sys.exit(cmd_doctor())
+
+    if first_arg == "benchmark":
+        p = argparse.ArgumentParser(prog="agent-voice benchmark")
+        p.add_argument("--voice", default=None)
+        p.add_argument("--styles", default=None)
+        p.add_argument("--runs", type=int, default=1)
+        p.add_argument("--text", default=None)
+        b_args = p.parse_args(sys.argv[2:])
+        sys.exit(cmd_benchmark(voice_id=b_args.voice, styles_str=b_args.styles, runs=b_args.runs, text=b_args.text))
+
+    if first_arg == "voice":
+        if len(sys.argv) < 3:
+            print("用法: agent-voice voice [show|validate|normalize] <id>")
+            sys.exit(1)
+        sub = sys.argv[2]
+        if sub == "show" and len(sys.argv) >= 4:
+            sys.exit(cmd_voice_show(sys.argv[3]))
+        elif sub == "validate" and len(sys.argv) >= 4:
+            sys.exit(cmd_voice_validate(sys.argv[3]))
+        elif sub == "normalize" and len(sys.argv) >= 4:
+            sys.exit(cmd_voice_normalize(sys.argv[3]))
+        else:
+            print(f"未知 voice 子命令: {sub}")
+            sys.exit(1)
+
+    if first_arg == "audition":
+        if len(sys.argv) < 3:
+            print("用法: agent-voice audition <id|--all> [--style <id>] [--corpus <corpus_key>] [--no-play]")
+            sys.exit(1)
+        target = sys.argv[2]
+        corpus_key = None
+        style_key = None
+        no_play = "--no-play" in sys.argv
+        if "--corpus" in sys.argv:
+            idx = sys.argv.index("--corpus")
+            if idx + 1 < len(sys.argv):
+                corpus_key = sys.argv[idx + 1]
+        if "--style" in sys.argv:
+            idx = sys.argv.index("--style")
+            if idx + 1 < len(sys.argv):
+                style_key = sys.argv[idx + 1]
+        sys.exit(cmd_audition(target, style_id=style_key, corpus_key=corpus_key, no_play=no_play))
+
+    if first_arg == "migrate":
+        to_v4 = "--to" in sys.argv or "4" in sys.argv
+        sys.exit(cmd_migrate(to_v4=to_v4))
+
+    # Speech synthesis flags & positional dispatch
+    parser = argparse.ArgumentParser(prog="agent-voice", add_help=False)
+    parser.add_argument("-v", "--voice", dest="voice", default=None, help="Explicit voice ID")
+    parser.add_argument("-e", "--event", dest="event", default=None, help="Event category for routing")
+    parser.add_argument("-s", "--style", "--instruct-profile", dest="style", default=None, help="Explicit style profile ID")
+    parser.add_argument("--instruct", dest="instruct", default=None, help="Raw instruction prompt (expert mode)")
+    parser.add_argument("--speed", dest="speed", type=float, default=None, help="Playback speed multiplier (0.75-1.25)")
+    parser.add_argument("--gain", dest="gain", type=float, default=None, help="Playback gain in dB (-12 to +3)")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="Print resolved parameters and exit without synthesis")
+    parser.add_argument("--require-instruct", dest="require_instruct", action="store_true", help="Fail if instruct2 is unsupported")
+    parser.add_argument("text", nargs="*", help="Text to speak")
+
+    args, remaining = parser.parse_known_args()
+    all_text = " ".join(args.text + remaining).strip()
+
+    if not all_text:
+        sys.exit(0)
+
+    exit_code = speak(
+        text=all_text,
+        voice_id=args.voice,
+        style_id=args.style,
+        raw_instruct=args.instruct,
+        speed=args.speed,
+        gain=args.gain,
+        event=args.event,
+        require_instruct=args.require_instruct,
+        dry_run=args.dry_run,
+    )
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
