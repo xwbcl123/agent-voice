@@ -225,7 +225,7 @@ Text → real model inference → WAV → speaker
 ## 4.1 Hardware
 
 - Apple Silicon Mac：
-  - M1 / M2 / M3 / M4 / 更新 M 系列
+  - M1 / M2 / M3 / M4 / M5 及更新 M 系列全谱系 (含 Base, Pro, Max, Ultra)
 - 建议至少：
   - 16 GB unified memory
 - 足够模型缓存空间：

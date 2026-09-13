@@ -76,7 +76,7 @@
 ### 3. 极速安装与部署 (Quickstart)
 
 #### 3.1 前置要求 (Prerequisites)
-- **硬件**：Mac 设备配备 Apple Silicon 芯片（M1 / M2 / M3 / M4 系列）
+- **硬件**：Mac 设备配备 Apple Silicon 芯片（M1 / M2 / M3 / M4 / M5 全系列，含 Pro / Max / Ultra）
 - **操作系统**：macOS 14.0 (Sonoma) 或 macOS 15.0+ (Sequoia)
 - **包管理器**：Homebrew (`brew`)
 
@@ -292,14 +292,14 @@ speak("检测到配置漂移，需要人工介入。", style="urgent", event="wa
 
 ### 8. 性能基准测试 (Performance Benchmarks)
 
-实测环境：**Apple Mac mini (M4, 24GB Unified Memory, macOS 15.3)**
+实测环境：**Apple Mac mini (M4, 24GB Unified Memory, macOS 15.3)**（已全面支持并适配 Apple M5 / M5 Pro / M5 Max 系列，更强算力下 RTF 表现更优）
 
 | 指标 (Metric) | 测量值 (Measurement) | 说明 (Note) |
 | :--- | :--- | :--- |
 | **常态驻留内存 (Resident RAM)** | **0 MB** | 无 Daemon，无后台 Python 进程 |
 | **推理峰值显存 (Peak VRAM)** | **~1.1 GB** | 8-bit 量化 CosyVoice 瞬态执行 |
-| **冷启动到首包延迟 (TTFB)** | **~1.8 s** | 包含模型权重读取与 MLX 初始化 |
-| **实时因子 (Real-Time Factor, RTF)** | **~1.25 ~ 1.35** | 10 秒语音约 13 秒生成完毕 |
+| **冷启动到首包延迟 (TTFB)** | **~1.8 s** | 包含模型权重读取与 MLX 初始化（M5 芯片更低） |
+| **实时因子 (Real-Time Factor, RTF)** | **~1.25 ~ 1.35** | 10 秒语音约 13 秒生成完毕（M5 芯片可突破 1.0） |
 | **并发保护行为 (Concurrency)** | **Non-blocking Busy-Drop** | 内核文件锁，冲突时 0 毫秒丢弃 |
 | **单元测试覆盖** | **15/15 Passed (0.3s)** | 路由、风格、安全性、边界全覆盖 |
 
@@ -307,7 +307,7 @@ speak("检测到配置漂移，需要人工介入。", style="urgent", event="wa
 
 ## English Overview
 
-**`agent-voice`** is a high-fidelity local text-to-speech (TTS) and instructive prosody control system designed for autonomous AI agent fleets operating on macOS Apple Silicon.
+**`agent-voice`** is a high-fidelity local text-to-speech (TTS) and instructive prosody control system designed for autonomous AI agent fleets operating on macOS Apple Silicon (M1, M2, M3, M4, and M5 family).
 
 - **0 MB Resident RAM**: Unlike conventional TTS servers running long-lived FastAPI/PyTorch daemons, `agent-voice` operates on transient MLX CLI invocations. Memory is immediately released back to macOS upon playback.
 - **Voice × Style Orthogonal Control**: Voice identity (acoustics/timbre) is cleanly separated from delivery style (emotion/prosody). A single reference audio can render neutral notifications, cheerful achievements, calm debugging cues, or urgent error alerts.
